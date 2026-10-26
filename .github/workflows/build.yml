@@ -11,6 +11,10 @@ jobs:
   build-apk:
     runs-on: ubuntu-22.04
 
+    env:
+      ANDROID_HOME:    /opt/android-sdk
+      ANDROID_SDK_ROOT: /opt/android-sdk
+
     steps:
 
       - name: Checkout
@@ -27,23 +31,16 @@ jobs:
         with:
           python-version: "3.10"
 
-      # ── FIX: libunwind-dev conflict حل تعارض ─────────────────────────────
-      # نثبّت libunwind-dev أولاً بشكل منفصل قبل أي شيء آخر
-      # ثم نستبعد gstreamer كلياً — Kivy/Android لا يحتاجه وقت البناء
-      - name: Fix libunwind conflict & install system deps
+      # ── system deps (بدون gstreamer) ──────────────────────────────────────
+      - name: Install system dependencies
         run: |
           sudo apt-get update -y
-
-          # ثبّت libunwind أولاً بمفرده لتجنّب التعارض
-          sudo apt-get install -y --no-install-recommends libunwind-dev
-
-          # باقي الـ deps بدون أي حزمة gstreamer
           sudo apt-get install -y --no-install-recommends \
-            build-essential git zip unzip \
+            build-essential git zip unzip wget \
             cmake ninja-build \
             autoconf libtool pkg-config \
             libffi-dev libssl-dev \
-            zlib1g-dev libltdl-dev \
+            zlib1g-dev libltdl-dev libunwind-dev \
             libbz2-dev libreadline-dev \
             libsqlite3-dev libncursesw5-dev \
             libgdbm-dev liblzma-dev uuid-dev \
@@ -52,13 +49,49 @@ jobs:
             ffmpeg libavcodec-dev \
             libavformat-dev libswscale-dev
 
-      # ── Cython مثبَّت على 0.29.36 — لا ترفعه (pyjnius يكسر مع 3.x) ──────
+      # ── FIX: Android SDK يدوياً ───────────────────────────────────────────
+      # buildozer يبحث عن sdkmanager في tools/bin/
+      # نثبّت cmdline-tools ونصنع symlink للمسار القديم حتى يجده buildozer
+      - name: Install Android SDK command-line tools
+        run: |
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip \
+               -O /tmp/cmdtools.zip
+          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+          mv /tmp/cmdtools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+
+          # symlink المسار القديم الذي يبحث عنه buildozer
+          mkdir -p $ANDROID_HOME/tools/bin
+          ln -sf $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+                 $ANDROID_HOME/tools/bin/sdkmanager
+          ln -sf $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager \
+                 $ANDROID_HOME/tools/bin/avdmanager
+
+          # أضف للـ PATH
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/tools/bin"                >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools"           >> $GITHUB_PATH
+
+      # ── قبول الرخص وتثبيت SDK packages ───────────────────────────────────
+      - name: Accept licenses & install SDK packages
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            --sdk_root=$ANDROID_HOME --licenses || true
+
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            --sdk_root=$ANDROID_HOME \
+            "platforms;android-33" \
+            "build-tools;33.0.2" \
+            "platform-tools"
+
+      # ── Python tools (Cython مثبَّت على 0.29.36 — لا ترفعه) ──────────────
       - name: Install Python build tools
         run: |
           pip install --upgrade pip wheel setuptools
           pip install "Cython==0.29.36"
           pip install "buildozer==1.5.0"
 
+      # ── cache NDK/Gradle (keyed على buildozer.spec) ───────────────────────
       - name: Cache buildozer & Gradle
         uses: actions/cache@v4
         with:
@@ -70,17 +103,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-bz-
 
-      - name: Accept Android SDK licenses
-        run: |
-          mkdir -p "$HOME/.buildozer/android/platform/android-sdk/licenses"
-          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n" \
-            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
-          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
-            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license"
-
+      # ── build ─────────────────────────────────────────────────────────────
       - name: Build debug APK
         run: buildozer -v android debug
+        env:
+          ANDROID_HOME:     ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
 
+      # ── upload (7 أيام) ───────────────────────────────────────────────────
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
